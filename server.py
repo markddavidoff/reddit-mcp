@@ -16,7 +16,9 @@ domain). It refuses other hosts unless REDDIT_MCP_ALLOW_ANY_URL=1 is set.
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
+import json
 import os
 import random
 import re
@@ -189,6 +191,34 @@ def _refine_entry(entry: ET.Element, limit: int | None = TEXT_MAX) -> dict:
         "text_total_chars": total_chars,
         "text_truncated": truncated,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Pagination cursor helpers
+#
+# Opaque token wrapping an (offset, confirmed) position for a later paginated
+# "full content" tool. Clients must treat it as opaque; `_decode_cursor` must
+# never raise on a missing/forged/stale token — fall back to (0, False)
+# (start over, unconfirmed) instead.
+# --------------------------------------------------------------------------- #
+def _encode_cursor(offset: int, confirmed: bool) -> str:
+    """Encode a pagination position as an opaque, URL-safe cursor token."""
+    payload = json.dumps({"o": offset, "c": confirmed}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_cursor(token: str | None) -> tuple[int, bool]:
+    """Decode a cursor from `_encode_cursor`, tolerating any invalid input."""
+    if not token:
+        return 0, False
+    try:
+        data = json.loads(base64.urlsafe_b64decode(token.encode("ascii")))
+        offset, confirmed = data["o"], data["c"]
+        if isinstance(offset, bool) or not isinstance(offset, int) or not isinstance(confirmed, bool):
+            return 0, False
+    except Exception:
+        return 0, False
+    return max(offset, 0), confirmed
 
 
 def _is_reddit_host(netloc: str) -> bool:
