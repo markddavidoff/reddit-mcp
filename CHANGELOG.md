@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Truncated-content marker + opt-in paginated full text across all four tools
+  (`search_reddit`, `browse_subreddit`, `get_post`, `fetch_json`). Responses carry
+  a structured `truncation` object (`truncated`, `total`, `entries_trimmed`) and an
+  opaque `cursor` when any content is trimmed; re-calling a tool with that `cursor`
+  paginates the full untrimmed content from the start (page size via
+  `REDDIT_MCP_PAGE_SIZE`, default 2000). The first expansion asks for confirmation
+  via MCP elicitation when the client supports it, and otherwise serves the page
+  with `truncation.elicited=false`. Per-entry fields `text_total_chars` and
+  `text_truncated` replace the old inline "… [truncated, N chars total]" suffix.
 - A `plugin/` directory that makes the server installable as a plugin from a
   marketplace in the format Claude Code, Codex and RK share. It runs
   `uvx reddit-rss-mcp`, and RK lists it in its built-in marketplace.
