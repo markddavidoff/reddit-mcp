@@ -27,7 +27,8 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from pydantic import BaseModel
 
 # Feed readers send their own User-Agent; Reddit serves RSS to them normally.
 USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "reddit-mcp/1.0 (personal RSS reader)")
@@ -112,8 +113,16 @@ async def _get_with_retry(
 # --------------------------------------------------------------------------- #
 # Fetch + parse
 # --------------------------------------------------------------------------- #
-async def _fetch_feed(url: str, params: dict | None = None) -> tuple[str | None, list[dict]]:
-    """GET an Atom feed and return (feed_title, [refined entries])."""
+async def _fetch_feed(
+    url: str, params: dict | None = None, limit: int | None = TEXT_MAX
+) -> tuple[str | None, list[dict]]:
+    """GET an Atom feed and return (feed_title, [refined entries]).
+
+    `limit` is forwarded to `_refine_entry` as its per-entry text trim limit;
+    pass `limit=None` to fetch full, untrimmed entry text (used by the
+    cursor-expansion path below, which re-fetches the same feed to rebuild
+    the full text it paginates over).
+    """
     headers = {"User-Agent": USER_AGENT}
     async with httpx.AsyncClient(
         timeout=TIMEOUT, follow_redirects=True, headers=headers
@@ -125,7 +134,7 @@ async def _fetch_feed(url: str, params: dict | None = None) -> tuple[str | None,
     except ET.ParseError as e:
         raise RuntimeError(f"Could not parse feed (not valid Atom XML): {e}")
     feed_title = root.findtext("a:title", namespaces=ATOM)
-    entries = [_refine_entry(e) for e in root.findall("a:entry", ATOM)]
+    entries = [_refine_entry(e, limit) for e in root.findall("a:entry", ATOM)]
     return feed_title, entries
 
 
@@ -144,13 +153,6 @@ def _trim_field(text: str | None, limit: int | None) -> tuple[str | None, int, b
     if limit is None or total <= limit:
         return text, total, False
     return text[:limit], total, True
-
-
-def _truncate(text: str | None, limit: int = TEXT_MAX) -> str | None:
-    # Delegates to _trim_field; callers here only want the shown text, with
-    # no inline "[truncated …]" suffix (structured trim fields replace it).
-    shown, _, _ = _trim_field(text, limit)
-    return shown
 
 
 def _html_to_text(raw: str | None, limit: int | None = TEXT_MAX) -> tuple[str | None, int, bool]:
@@ -221,6 +223,132 @@ def _decode_cursor(token: str | None) -> tuple[int, bool]:
     return max(offset, 0), confirmed
 
 
+# --------------------------------------------------------------------------- #
+# Opt-in full-content pagination
+#
+# Page 1 of every tool stays trimmed and, when anything was trimmed, carries
+# a top-level `truncation` marker plus a `cursor`. A client that wants more
+# calls the same tool again with that cursor; `_paginate` re-fetches the feed
+# untrimmed and hands the concatenated text to `_expand`, which confirms once
+# via `ctx.elicit` before serving each page (Task 1 POC: elicit needs a
+# stateful transport — wired up in a later deploy task, not here).
+# --------------------------------------------------------------------------- #
+def _page_size() -> int:
+    """Page size for cursor-paginated expansion: REDDIT_MCP_PAGE_SIZE, or TEXT_MAX."""
+    raw = os.environ.get("REDDIT_MCP_PAGE_SIZE", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return TEXT_MAX
+
+
+class _ConfirmFull(BaseModel):
+    """Yes/no elicit schema: confirm before serving a page of full content."""
+
+    confirm: bool
+
+
+def _build_truncation_marker(entries: list[dict], page_size: int) -> tuple[dict, str | None]:
+    """Top-level `truncation` marker + opt-in cursor for a page-1 response.
+
+    `total` sums each entry's `text_total_chars` (the full, untrimmed length)
+    so it lines up with what `_expand` computes once a client re-fetches the
+    same entries with `limit=None` and concatenates them in return order.
+    """
+    entries_trimmed = sum(1 for e in entries if e.get("text_truncated"))
+    truncated = entries_trimmed > 0
+    total = sum(e.get("text_total_chars") or 0 for e in entries)
+    marker = {"truncated": truncated, "total": total, "entries_trimmed": entries_trimmed}
+    cursor = _encode_cursor(page_size, False) if truncated else None
+    return marker, cursor
+
+
+async def _expand(ctx: Context | None, full_text: str, token: str | None) -> dict:
+    """Serve one cursor-paginated page of `full_text`.
+
+    Returns {"page_text", "cursor", "truncation": {...}}. An unconfirmed
+    cursor triggers one `ctx.elicit` confirmation: accept serves the slice
+    with a now-confirmed next cursor; decline serves nothing
+    (`truncation.declined`). If elicit raises (client doesn't support it, or
+    any other transport error), fall back to serving the slice anyway with
+    `truncation.elicited = False` instead of hanging or erroring.
+    """
+    offset, confirmed = _decode_cursor(token)
+    total = len(full_text)
+    page_size = _page_size()
+
+    if offset >= total:
+        return {
+            "page_text": "",
+            "cursor": None,
+            "truncation": {"truncated": False, "shown": 0, "total": total, "elicited": True},
+        }
+
+    elicited = True
+    if not confirmed:
+        try:
+            result = await ctx.elicit(
+                message=(
+                    f"Show the next {min(page_size, total - offset)} characters "
+                    f"of {total} total?"
+                ),
+                schema=_ConfirmFull,
+            )
+        except Exception:
+            # Client doesn't support elicitation, or some other transport
+            # error — fall back to serving the page rather than hanging.
+            elicited = False
+        else:
+            if result.action != "accept":
+                return {
+                    "page_text": "",
+                    "cursor": None,
+                    "truncation": {
+                        "truncated": True,
+                        "shown": 0,
+                        "total": total,
+                        "elicited": True,
+                        "declined": True,
+                    },
+                }
+
+    page_text = full_text[offset : offset + page_size]
+    next_offset = offset + page_size
+    # Once a page has been served (accepted, already confirmed, or served via
+    # the unsupported-elicit fallback), treat the position as confirmed so a
+    # client that doesn't support elicit isn't asked again on every page.
+    next_cursor = _encode_cursor(next_offset, True) if next_offset < total else None
+    return {
+        "page_text": page_text,
+        "cursor": next_cursor,
+        "truncation": {
+            "truncated": next_cursor is not None,
+            "shown": len(page_text),
+            "total": total,
+            "elicited": elicited,
+        },
+    }
+
+
+async def _paginate(ctx: Context | None, cursor: str | None, fetch_full) -> dict | None:
+    """Shared cursor branch for all four tools.
+
+    `fetch_full` is an async, no-arg callable that re-fetches the same feed
+    with `limit=None` and returns entries in the same order used for the
+    page-1 truncation marker. Returns None when `cursor` is absent, so the
+    caller proceeds with its normal trimmed page-1 response.
+    """
+    if cursor is None:
+        return None
+    entries = await fetch_full()
+    full_text = "".join(e.get("text") or "" for e in entries)
+    return await _expand(ctx, full_text, cursor)
+
+
 def _is_reddit_host(netloc: str) -> bool:
     host = netloc.lower().split(":")[0]
     return host == "reddit.com" or host.endswith(".reddit.com")
@@ -245,6 +373,8 @@ async def browse_subreddit(
     sort: str = "hot",
     time_filter: str = "day",
     limit: int = 25,
+    cursor: str | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Read what a subreddit is posting right now, to see a community's live activity.
 
@@ -259,6 +389,8 @@ async def browse_subreddit(
         sort: One of hot, new, top, rising, controversial.
         time_filter: For top/controversial — hour, day, week, month, year, all.
         limit: Number of posts (1-100).
+        cursor: Opaque token from a previous call's `cursor`, to page through
+            a post's full, untrimmed text instead of the default trimmed page.
     """
     sub = subreddit.strip().removeprefix("r/").strip("/")
     sort = sort.strip().lower()
@@ -266,18 +398,38 @@ async def browse_subreddit(
     params: dict[str, str | int] = {"limit": limit}
     if sort in ("top", "controversial"):
         params["t"] = time_filter
-    title, entries = await _fetch_feed(f"{REDDIT_BASE}/r/{sub}/{sort}/.rss", params)
-    return {
+    feed_url = f"{REDDIT_BASE}/r/{sub}/{sort}/.rss"
+
+    async def _fetch_full():
+        _, full_entries = await _fetch_feed(feed_url, params, limit=None)
+        return full_entries
+
+    expanded = await _paginate(ctx, cursor, _fetch_full)
+    if expanded is not None:
+        return expanded
+
+    title, entries = await _fetch_feed(feed_url, params)
+    marker, next_cursor = _build_truncation_marker(entries, _page_size())
+    result = {
         "subreddit": sub,
         "sort": sort,
         "feed_title": title,
         "count": len(entries),
         "posts": entries,
+        "truncation": marker,
     }
+    if next_cursor is not None:
+        result["cursor"] = next_cursor
+    return result
 
 
 @mcp.tool()
-async def get_post(url: str, comment_limit: int = 50) -> dict:
+async def get_post(
+    url: str,
+    comment_limit: int = 50,
+    cursor: str | None = None,
+    ctx: Context | None = None,
+) -> dict:
     """Read one Reddit thread in full: the original post plus its comments.
 
     Use this after a search or a browse turns up a promising thread and you need
@@ -292,6 +444,8 @@ async def get_post(url: str, comment_limit: int = 50) -> dict:
             https://www.reddit.com/r/python/comments/abc123/title/ or
             /r/python/comments/abc123/title/).
         comment_limit: Max comments to return.
+        cursor: Opaque token from a previous call's `cursor`, to page through
+            the post's and comments' full, untrimmed text.
     """
     u = url.strip()
     path = u if u.startswith("/") else urlsplit(u).path
@@ -300,17 +454,36 @@ async def get_post(url: str, comment_limit: int = 50) -> dict:
         path = path[: -len("/.rss")]
     feed_url = f"{REDDIT_BASE}{path}/.rss"
 
+    def _ordered(entries: list[dict]) -> tuple[list[dict], list[dict]]:
+        posts = [e for e in entries if e["type"] == "post"]
+        comments = [e for e in entries if e["type"] == "comment"][:comment_limit]
+        return posts, comments
+
+    async def _fetch_full():
+        _, full_entries = await _fetch_feed(feed_url, {"limit": comment_limit}, limit=None)
+        posts_f, comments_f = _ordered(full_entries)
+        return ([posts_f[0]] if posts_f else []) + comments_f
+
+    expanded = await _paginate(ctx, cursor, _fetch_full)
+    if expanded is not None:
+        return expanded
+
     _, entries = await _fetch_feed(feed_url, {"limit": comment_limit})
-    posts = [e for e in entries if e["type"] == "post"]
-    comments = [e for e in entries if e["type"] == "comment"][:comment_limit]
+    posts, comments = _ordered(entries)
     if not posts and not comments:
         raise RuntimeError("No content found — is this a valid post URL?")
 
-    return {
+    marker_entries = ([posts[0]] if posts else []) + comments
+    marker, next_cursor = _build_truncation_marker(marker_entries, _page_size())
+    result = {
         "post": posts[0] if posts else None,
         "comment_count": len(comments),
         "comments": comments,
+        "truncation": marker,
     }
+    if next_cursor is not None:
+        result["cursor"] = next_cursor
+    return result
 
 
 @mcp.tool()
@@ -320,6 +493,8 @@ async def search_reddit(
     sort: str = "relevance",
     time_filter: str = "all",
     limit: int = 25,
+    cursor: str | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Search Reddit discussions for real user opinions and experiences on a topic.
 
@@ -337,6 +512,8 @@ async def search_reddit(
         sort: relevance, hot, top, new, comments.
         time_filter: hour, day, week, month, year, all.
         limit: Number of results (1-100).
+        cursor: Opaque token from a previous call's `cursor`, to page through
+            a result's full, untrimmed text.
     """
     limit = max(1, min(int(limit), 100))
     # The search feed mixes subreddit matches (t5) in with posts, so ask for a
@@ -348,13 +525,30 @@ async def search_reddit(
         url = f"{REDDIT_BASE}/r/{sub}/search.rss"
     else:
         url = f"{REDDIT_BASE}/search.rss"
+
+    async def _fetch_full():
+        _, full_entries = await _fetch_feed(url, params, limit=None)
+        return [e for e in full_entries if e["type"] == "post"][:limit]
+
+    expanded = await _paginate(ctx, cursor, _fetch_full)
+    if expanded is not None:
+        return expanded
+
     title, entries = await _fetch_feed(url, params)
     posts = [e for e in entries if e["type"] == "post"][:limit]
-    return {"query": query, "count": len(posts), "results": posts}
+    marker, next_cursor = _build_truncation_marker(posts, _page_size())
+    result = {"query": query, "count": len(posts), "results": posts, "truncation": marker}
+    if next_cursor is not None:
+        result["cursor"] = next_cursor
+    return result
 
 
 @mcp.tool()
-async def fetch_json(url: str) -> dict:
+async def fetch_json(
+    url: str,
+    cursor: str | None = None,
+    ctx: Context | None = None,
+) -> dict:
     """Read a Reddit feed the other tools do not cover: a user, multireddit, or domain.
 
     Use this only for Reddit URLs outside the usual shapes, such as
@@ -367,6 +561,8 @@ async def fetch_json(url: str) -> dict:
 
     Args:
         url: A reddit.com URL.
+        cursor: Opaque token from a previous call's `cursor`, to page through
+            an entry's full, untrimmed text (Reddit-hosted URLs only).
     """
     parts = urlsplit(url.strip())
 
@@ -375,8 +571,27 @@ async def fetch_json(url: str) -> dict:
         if not path.endswith(".rss"):
             path += "/.rss"
         target = urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
+
+        async def _fetch_full():
+            _, full_entries = await _fetch_feed(target, limit=None)
+            return full_entries
+
+        expanded = await _paginate(ctx, cursor, _fetch_full)
+        if expanded is not None:
+            return expanded
+
         title, entries = await _fetch_feed(target)
-        return {"url": target, "feed_title": title, "count": len(entries), "entries": entries}
+        marker, next_cursor = _build_truncation_marker(entries, _page_size())
+        result = {
+            "url": target,
+            "feed_title": title,
+            "count": len(entries),
+            "entries": entries,
+            "truncation": marker,
+        }
+        if next_cursor is not None:
+            result["cursor"] = next_cursor
+        return result
 
     if not _allow_any_url():
         raise ValueError(
@@ -407,11 +622,16 @@ async def fetch_json(url: str) -> dict:
     try:
         return {"url": str(resp.url), "data": resp.json()}
     except ValueError:
+        # Structured trim fields (Task 2 pattern), not an inline "[truncated
+        # ...]" suffix baked into the text.
+        shown, total_chars, truncated = _trim_field(resp.text, 5000)
         return {
             "url": str(resp.url),
             "note": f"Response was not JSON (content-type: "
             f"{resp.headers.get('content-type', '')}).",
-            "text": _truncate(resp.text, 5000),
+            "text": shown,
+            "text_total_chars": total_chars,
+            "text_truncated": truncated,
         }
 
 
