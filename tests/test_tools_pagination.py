@@ -21,6 +21,7 @@ emits instead of a hand-crafted dict fixture.
 from __future__ import annotations
 
 import asyncio
+import math
 import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 
@@ -92,7 +93,10 @@ def test_default_call_sets_truncation_marker_and_cursor(monkeypatch):
     assert "elicited" not in result["truncation"]
     assert result.get("cursor")
     offset, confirmed = server._decode_cursor(result["cursor"])
-    assert (offset, confirmed) == (server._page_size(), False)
+    # Expansion always paginates the entire concatenated content from offset
+    # 0 (not "from where page 1 left off" — page 1 trims each entry
+    # independently, so there's no single aggregate offset to resume from).
+    assert (offset, confirmed) == (0, False)
 
 
 def test_expansion_elicit_accept_returns_next_slice(monkeypatch):
@@ -116,6 +120,20 @@ def test_expansion_elicit_decline_returns_empty(monkeypatch):
     monkeypatch.setattr(server, "_fetch_feed", _fake_fetch_feed([_atom_entry(full)]))
     cursor = server._encode_cursor(server._page_size(), False)
     ctx = FakeContext(action="decline")
+
+    result = asyncio.run(server.browse_subreddit("python", cursor=cursor, ctx=ctx))
+
+    assert result["page_text"] == ""
+    assert result["truncation"]["declined"] is True
+    assert result["truncation"]["elicited"] is True
+
+
+def test_expansion_elicit_cancel_returns_empty(monkeypatch):
+    """`result.action == "cancel"` behaves exactly like "decline"."""
+    full = "z" * 5000
+    monkeypatch.setattr(server, "_fetch_feed", _fake_fetch_feed([_atom_entry(full)]))
+    cursor = server._encode_cursor(server._page_size(), False)
+    ctx = FakeContext(action="cancel")
 
     result = asyncio.run(server.browse_subreddit("python", cursor=cursor, ctx=ctx))
 
@@ -162,6 +180,8 @@ def test_offset_past_end_returns_empty_not_error(monkeypatch):
     assert result["truncation"]["truncated"] is False
     assert result.get("cursor") is None
     assert ctx.elicit_calls == 0
+    # No elicit call was made, so `elicited` must say so, not hardcode True.
+    assert result["truncation"]["elicited"] is False
 
 
 def test_fetch_json_nonjson_uses_marker(monkeypatch):
@@ -209,6 +229,57 @@ def test_fetch_json_nonjson_uses_marker(monkeypatch):
     assert result["text_truncated"] is True
     assert len(result["text"]) == 5000
     assert "[truncated" not in (result["text"] or "")
+
+
+def test_multi_entry_expansion_reconstructs_full_text_exactly(monkeypatch):
+    """Regression for the multi-entry cursor bug: page 1 trims EACH entry to
+    page_size independently, so there is no single aggregate offset marking
+    "what page 1 already showed" across multiple entries. Expansion must
+    paginate the ENTIRE concatenated content from offset 0, not resume from
+    `page_size` — single-entry fixtures elsewhere in this file can't catch
+    this because with one entry the two models coincide.
+
+    Verified end to end: page through every expansion slice and confirm
+    they reconstruct `concat_full` exactly (no loss, gap, or duplication
+    beyond the intended contiguous slices), with exactly
+    `ceil(len(concat_full) / page_size)` pages.
+    """
+    monkeypatch.setenv("REDDIT_MCP_PAGE_SIZE", "2000")
+    page_size = server._page_size()
+    assert page_size == 2000
+
+    texts = ["a" * 3000, "b" * 3000, "c" * 3000]  # 3 entries, 9000 chars total
+    monkeypatch.setattr(server, "_fetch_feed", _fake_fetch_feed([_atom_entry(t) for t in texts]))
+    concat_full = "".join(texts)
+
+    # Page 1: trimmed preview + marker; cursor starts unconfirmed at offset 0.
+    page1 = asyncio.run(server.browse_subreddit("python"))
+    assert page1["truncation"]["truncated"] is True
+    offset, confirmed = server._decode_cursor(page1["cursor"])
+    assert (offset, confirmed) == (0, False)
+
+    # First expansion page: accept once, serves concat_full[0:page_size],
+    # with a confirmed next cursor at offset page_size.
+    ctx = FakeContext(action="accept")
+    page2 = asyncio.run(server.browse_subreddit("python", cursor=page1["cursor"], ctx=ctx))
+    assert page2["page_text"] == concat_full[:page_size]
+    offset, confirmed = server._decode_cursor(page2["cursor"])
+    assert (offset, confirmed) == (page_size, True)
+    assert ctx.elicit_calls == 1
+
+    # Page through to the end — already confirmed, so no further elicits —
+    # reconstructing the full text from every served slice.
+    expansion_pages = [page2["page_text"]]
+    cursor = page2["cursor"]
+    while cursor is not None:
+        ctx2 = FakeContext(action="accept")  # must NOT be called: confirmed=True
+        result = asyncio.run(server.browse_subreddit("python", cursor=cursor, ctx=ctx2))
+        assert ctx2.elicit_calls == 0
+        expansion_pages.append(result["page_text"])
+        cursor = result["cursor"]
+
+    assert "".join(expansion_pages) == concat_full
+    assert len(expansion_pages) == math.ceil(len(concat_full) / page_size)
 
 
 def test_refine_entry_full_text_path_feeds_expansion():

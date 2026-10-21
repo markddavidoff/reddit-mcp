@@ -252,18 +252,25 @@ class _ConfirmFull(BaseModel):
     confirm: bool
 
 
-def _build_truncation_marker(entries: list[dict], page_size: int) -> tuple[dict, str | None]:
+def _build_truncation_marker(entries: list[dict]) -> tuple[dict, str | None]:
     """Top-level `truncation` marker + opt-in cursor for a page-1 response.
 
     `total` sums each entry's `text_total_chars` (the full, untrimmed length)
     so it lines up with what `_expand` computes once a client re-fetches the
     same entries with `limit=None` and concatenates them in return order.
+
+    Expansion always paginates the *entire* concatenated content from
+    offset 0 — not from "where page 1 left off" — because page 1 trims each
+    entry independently, so there is no single aggregate offset that marks
+    "what page 1 already showed" across multiple entries. The starting
+    cursor is therefore always `(0, confirmed=False)`; re-showing
+    preview content on the first expansion page is expected.
     """
     entries_trimmed = sum(1 for e in entries if e.get("text_truncated"))
     truncated = entries_trimmed > 0
     total = sum(e.get("text_total_chars") or 0 for e in entries)
     marker = {"truncated": truncated, "total": total, "entries_trimmed": entries_trimmed}
-    cursor = _encode_cursor(page_size, False) if truncated else None
+    cursor = _encode_cursor(0, False) if truncated else None
     return marker, cursor
 
 
@@ -282,10 +289,11 @@ async def _expand(ctx: Context | None, full_text: str, token: str | None) -> dic
     page_size = _page_size()
 
     if offset >= total:
+        # Nothing left to show, so no elicit call is made either way.
         return {
             "page_text": "",
             "cursor": None,
-            "truncation": {"truncated": False, "shown": 0, "total": total, "elicited": True},
+            "truncation": {"truncated": False, "shown": 0, "total": total, "elicited": False},
         }
 
     elicited = True
@@ -409,7 +417,7 @@ async def browse_subreddit(
         return expanded
 
     title, entries = await _fetch_feed(feed_url, params)
-    marker, next_cursor = _build_truncation_marker(entries, _page_size())
+    marker, next_cursor = _build_truncation_marker(entries)
     result = {
         "subreddit": sub,
         "sort": sort,
@@ -474,7 +482,7 @@ async def get_post(
         raise RuntimeError("No content found — is this a valid post URL?")
 
     marker_entries = ([posts[0]] if posts else []) + comments
-    marker, next_cursor = _build_truncation_marker(marker_entries, _page_size())
+    marker, next_cursor = _build_truncation_marker(marker_entries)
     result = {
         "post": posts[0] if posts else None,
         "comment_count": len(comments),
@@ -536,7 +544,7 @@ async def search_reddit(
 
     title, entries = await _fetch_feed(url, params)
     posts = [e for e in entries if e["type"] == "post"][:limit]
-    marker, next_cursor = _build_truncation_marker(posts, _page_size())
+    marker, next_cursor = _build_truncation_marker(posts)
     result = {"query": query, "count": len(posts), "results": posts, "truncation": marker}
     if next_cursor is not None:
         result["cursor"] = next_cursor
@@ -581,7 +589,7 @@ async def fetch_json(
             return expanded
 
         title, entries = await _fetch_feed(target)
-        marker, next_cursor = _build_truncation_marker(entries, _page_size())
+        marker, next_cursor = _build_truncation_marker(entries)
         result = {
             "url": target,
             "feed_title": title,
