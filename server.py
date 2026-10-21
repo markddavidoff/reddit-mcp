@@ -130,33 +130,52 @@ async def _fetch_feed(url: str, params: dict | None = None) -> tuple[str | None,
 # --------------------------------------------------------------------------- #
 # Refinement helpers
 # --------------------------------------------------------------------------- #
-def _truncate(text: str | None, limit: int = TEXT_MAX) -> str | None:
+def _trim_field(text: str | None, limit: int | None) -> tuple[str | None, int, bool]:
+    """Trim text to `limit` chars, reporting the full length and whether trimmed.
+
+    Returns (shown, total_chars, truncated). `limit=None` returns the full
+    text untrimmed.
+    """
     if not text:
-        return text
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"… [truncated, {len(text)} chars total]"
+        return text, 0, False
+    total = len(text)
+    if limit is None or total <= limit:
+        return text, total, False
+    return text[:limit], total, True
 
 
-def _html_to_text(raw: str | None, limit: int = TEXT_MAX) -> str | None:
-    """Convert the HTML in a feed <content> to readable plain text."""
+def _truncate(text: str | None, limit: int = TEXT_MAX) -> str | None:
+    # Delegates to _trim_field; callers here only want the shown text, with
+    # no inline "[truncated …]" suffix (structured trim fields replace it).
+    shown, _, _ = _trim_field(text, limit)
+    return shown
+
+
+def _html_to_text(raw: str | None, limit: int | None = TEXT_MAX) -> tuple[str | None, int, bool]:
+    """Convert the HTML in a feed <content> to readable plain text.
+
+    Returns (shown, total_chars, truncated) via `_trim_field`.
+    """
     if not raw:
-        return raw
+        return raw, 0, False
     s = re.sub(r"(?is)<(script|style).*?</\1>", "", raw)
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
     s = re.sub(r"(?i)</p>", "\n\n", s)
     s = re.sub(r"(?s)<[^>]+>", "", s)
     s = html.unescape(s)
     s = re.sub(r"\n{3,}", "\n\n", s).strip()
-    return _truncate(s, limit)
+    return _trim_field(s, limit)
 
 
-def _refine_entry(entry: ET.Element) -> dict:
+def _refine_entry(entry: ET.Element, limit: int | None = TEXT_MAX) -> dict:
     """Reduce an Atom entry (post or comment) to the useful fields."""
     full_id = entry.findtext("a:id", default="", namespaces=ATOM)
     kind, _, short_id = full_id.partition("_")  # e.g. "t3_abc123"
     link_el = entry.find("a:link", ATOM)
     category = entry.find("a:category", ATOM)
+    text, total_chars, truncated = _html_to_text(
+        entry.findtext("a:content", namespaces=ATOM), limit
+    )
     return {
         "id": short_id or full_id,
         "type": {"t3": "post", "t1": "comment"}.get(kind, kind or None),
@@ -166,7 +185,9 @@ def _refine_entry(entry: ET.Element) -> dict:
         "published": entry.findtext("a:published", namespaces=ATOM),
         "updated": entry.findtext("a:updated", namespaces=ATOM),
         "link": link_el.get("href") if link_el is not None else None,
-        "text": _html_to_text(entry.findtext("a:content", namespaces=ATOM)),
+        "text": text,
+        "text_total_chars": total_chars,
+        "text_truncated": truncated,
     }
 
 
